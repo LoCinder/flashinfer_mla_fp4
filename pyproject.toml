@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flashinfer_mla_fp4"
+version = "0.1.0"
+description = "Per-token-scaled FP4 MLA decode sidecar for FlashInfer"
+readme = "README.md"
+license-files = ["LICENSE"]
+requires-python = ">=3.10,<4.0"
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["flashinfer_mla_fp4*"]
