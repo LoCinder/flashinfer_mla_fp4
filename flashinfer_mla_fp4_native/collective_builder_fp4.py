@@ -10,6 +10,7 @@ import cutlass.cute as cute
 import cutlass.cute.nvgpu.cpasync as cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
+import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.typing import Int64
 
@@ -103,14 +104,16 @@ def build_mla_fp4_launch_params(
     # expands each packed E2M1 latent nibble into one byte. RoPE remains E4M3
     # so the independent 64-d E4M3 MMA stays legal and numerically complete.
     kv_smem_dtype = cutlass.Uint8
+    qk_dtype = cutlass.Float4E2M1FN
+    kc_smem_dtype = qk_dtype
     rope_smem_dtype = q_dtype
 
-    qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
-        q_dtype,
-        k_dtype,
+    qk_tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
+        qk_dtype,
         q_major_mode,
         k_major_mode,
-        config.acc_dtype,
+        cutlass.Float8E4M3FN,
+        16,
         cta_group,
         config.mma_qk_tiler[:2],
     )
@@ -141,7 +144,7 @@ def build_mla_fp4_launch_params(
     q_latent_smem_layout_staged = sm100_utils.make_smem_layout_a(
         qk_tiled_mma,
         config.mma_qk_tiler,
-        q_dtype,
+        qk_dtype,
         (config.iterations_qk_latent * config.load_q_stage),
     )
     q_latent_smem_layout_staged = cute.logical_divide(
@@ -159,7 +162,7 @@ def build_mla_fp4_launch_params(
     kc_latent_smem_layout_staged = sm100_utils.make_smem_layout_b(
         qk_tiled_mma,
         config.mma_qk_tiler,
-        kv_smem_dtype,
+        kc_smem_dtype,
         (config.iterations_qk_latent * config.load_k_stage),
     )
     kc_page_tile_size = min(
@@ -174,7 +177,7 @@ def build_mla_fp4_launch_params(
     kc_latent_smem_layout_for_tma = sm100_utils.make_smem_layout(
         OperandMajorMode.K,
         (config.mma_qk_tiler[0] // qk_tiled_mma.thr_id.shape, config.mma_qk_tiler[2]),
-        kv_smem_dtype,
+        kc_smem_dtype,
         (config.iterations_qk_latent * config.load_k_stage),
     )
     kc_latent_smem_layout_for_tma = cute.tiled_divide(
@@ -290,7 +293,7 @@ def build_mla_fp4_launch_params(
         qk_tiled_mma,
         config.page_size,
         is_k_load=True,
-        internal_type=kv_smem_dtype,
+        internal_type=kc_smem_dtype,
     )
     kc_rope_smem_layout = cute.select(kc_rope_smem_layout_for_tma, mode=[0])
     tma_atom_c_rope, tma_tensor_c_rope = _make_paged_tiled_tma_atom(
@@ -319,7 +322,7 @@ def build_mla_fp4_launch_params(
 
     # --- Copy sizes ---
     q_latent_copy_size = (
-        cute.size_in_bytes(q_dtype, q_smem_layout)
+        cute.size_in_bytes(qk_dtype, q_smem_layout)
         * cute.size(qk_tiled_mma.thr_id.shape)
         * config.iterations_qk_latent
     )
@@ -362,9 +365,23 @@ def build_mla_fp4_launch_params(
     align = mainloop.buffer_align_bytes
     threads_per_warp = schedule.threads_per_warp
     num_compute_warps = config.num_compute_warps
-    token_scale_stages = config.mma_s_stage
+    token_scale_stages = config.token_scale_stages
     token_scale_elements = (
         config.mma_qk_tiler[1] * config.num_scale_groups * token_scale_stages
+    )
+    # The 128-row S2T scale atom pads CTA-local Q rows; each CTA fills its own
+    # 64 valid rows. K's 128-token scale tile is replicated in the CTA pair.
+    q_sf_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
+        qk_dtype, q_major_mode, k_major_mode, cutlass.Float8E4M3FN, 16,
+        tcgen05.CtaGroup.ONE, config.mma_qk_tiler[:2],
+    )
+    q_sf_layout = blockscaled_utils.make_smem_layout_sfa(
+        q_sf_mma, config.mma_qk_tiler, 16,
+        config.iterations_qk_latent * config.load_q_stage,
+    )
+    k_sf_layout = blockscaled_utils.make_smem_layout_sfb(
+        qk_tiled_mma, config.mma_qk_tiler, 16,
+        config.iterations_qk_latent * config.load_k_stage,
     )
 
     @cute.struct
@@ -384,7 +401,7 @@ def build_mla_fp4_launch_params(
         ]
         smem_kc_latent: cute.struct.Align[
             cute.struct.MemRange[
-                kv_smem_dtype, cute.cosize(kc_latent_smem_layout_staged)
+                kc_smem_dtype, cute.cosize(kc_latent_smem_layout_staged)
             ],
             align,
         ]
@@ -395,7 +412,7 @@ def build_mla_fp4_launch_params(
             align,
         ]
         smem_q_latent: cute.struct.Align[
-            cute.struct.MemRange[q_dtype, cute.cosize(q_latent_smem_layout_staged)],
+            cute.struct.MemRange[qk_dtype, cute.cosize(q_latent_smem_layout_staged)],
             align,
         ]
         smem_q_rope: cute.struct.Align[
@@ -407,6 +424,12 @@ def build_mla_fp4_launch_params(
             align,
         ]
         smem_token_scale: cute.struct.MemRange[config.acc_dtype, token_scale_elements]
+        smem_q_sf: cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float8E4M3FN, cute.cosize(q_sf_layout)], 128
+        ]
+        smem_k_sf: cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float8E4M3FN, cute.cosize(k_sf_layout)], 128
+        ]
         softmax_smem_exchange: cute.struct.MemRange[
             config.acc_dtype, num_compute_warps * threads_per_warp
         ]
@@ -420,6 +443,8 @@ def build_mla_fp4_launch_params(
         def size_in_bytes(cls) -> int: ...  # noqa: F811
 
     return SimpleNamespace(
+        q_sf_layout=q_sf_layout,
+        k_sf_layout=k_sf_layout,
         qk_tiled_mma=qk_tiled_mma,
         pv_tiled_mma=pv_tiled_mma,
         q_latent_smem_layout_staged=q_latent_smem_layout_staged,

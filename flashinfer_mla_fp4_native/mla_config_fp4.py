@@ -1,11 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Compile-time configuration for per-token-scaled FP4 MLA decode."""
+"""Native block-scaled QK with an unchanged per-token FP4 PV path."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from flashinfer.cute_dsl.attention.mainloop_spec import MLAMainloopSpec
 from flashinfer.cute_dsl.attention.mla_config import MLAConfig
@@ -19,20 +19,15 @@ from flashinfer.cute_dsl.attention.pipeline_topology import (
 
 @dataclass(frozen=True)
 class MLAConfigFP4(MLAConfig):
-    """MLA configuration for per-token-scaled FP4 latent and E4M3 RoPE KV.
-
-    The latent dimension is packed E2M1 with one effective FP32 scale per token.  The
-    independent RoPE field and query remain E4M3.  This is deliberately a
-    sibling configuration rather than a flag on :class:`MLAConfig` so the
-    dense FP8 path stays unchanged.
-    """
+    """One E2M1 payload; fitted block16 K scales and original FP32 V scales."""
 
     is_fp8: bool = True
     scale_group_width: int = 512
-    load_k_stage: int = 2
+    load_k_stage: int = 4
     load_v_stage: int = 2
     p_mma_stage: int = 2
     mma_o_stage: int = 2
+    token_scale_stages: int = 4
 
     @property
     def num_scale_groups(self) -> int:
@@ -40,8 +35,9 @@ class MLAConfigFP4(MLAConfig):
 
 
 MLA_DECODE_FP4_SCHEDULE = MLAWarpScheduleFP8(
-    softmax_reg_num=240,
-    correction_reg_num=208,
+    softmax_reg_num=208,
+    correction_reg_num=224,
+    other_reg_num=64,
 )
 
 
@@ -49,7 +45,7 @@ def make_mla_fp4_mainloop_spec(
     config: MLAConfigFP4,
     schedule: MLAWarpScheduleFP8 | None = None,
 ) -> MLAMainloopSpec:
-    """Create the mainloop specification for per-token-scaled FP4 MLA."""
+    """Create the mainloop for native FP4 QK and per-token-scaled PV."""
 
     sched = schedule if schedule is not None else MLA_DECODE_FP4_SCHEDULE
     topology = make_mla_fp8_topology(
@@ -67,11 +63,17 @@ def make_mla_fp4_mainloop_spec(
         PipelineEdge(
             "load_scale",
             PipelineType.CP_ASYNC,
-            stages=config.mma_s_stage,
-            producer_warp_ids=(sched.load_tma_k_warp_id,),
+            stages=config.token_scale_stages,
+            producer_warp_ids=(11,),
             consumer_warp_ids=sched.compute_warp_ids,
         )
     )
+    assert 11 in sched.empty_warp_ids
+    topology.edges = [
+        replace(edge, producer_warp_ids=(sched.load_tma_k_warp_id, 11))
+        if edge.name in ("load_q", "load_k") else edge
+        for edge in topology.edges
+    ]
     return MLAMainloopSpec(
         config=config,
         warp_schedule=sched,

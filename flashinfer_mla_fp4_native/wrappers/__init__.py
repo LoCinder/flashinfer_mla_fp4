@@ -1,0 +1,1 @@
+"""MLA decode invocation interface."""
