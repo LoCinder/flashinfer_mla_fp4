@@ -1,280 +1,133 @@
-# Copyright (c) 2026 by FlashInfer team.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#   http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+"""Quantization, decode boundaries and packed V conversion correctness."""
 
-"""Tests for per-token-scaled FP4 CuTe DSL MLA decode."""
-
-from dataclasses import dataclass
-from statistics import median
-
+import cutlass
+import cutlass.cute as cute
 import pytest
 import torch
 
-from flashinfer.cute_dsl import is_cute_dsl_available
-from flashinfer.cute_dsl.attention import BatchMLADecodeCuteDSLWrapper
-from flashinfer.testing import bench_gpu_time
-from flashinfer.utils import is_sm100a_supported, is_sm110a_supported
-from flashinfer_mla_fp4 import BatchMLADecodeCuteDSLFP4Wrapper
-
-LATENT_DIM, ROPE_DIM = 512, 64
+from flashinfer_mla_fp4_fused_dequant import Runner
+from flashinfer_mla_fp4_fused_dequant.quantization.quantize import quantize
+from flashinfer_mla_fp4_fused_dequant.roles.mla_dequant_v import _dequantize_e2m1x8
+from gpu_guard import check, start
+from reference import nvfp4, reference, unpack
 
 
-@dataclass
-class _Case:
-    query: torch.Tensor
-    fp4_cache: torch.Tensor
-    token_scale: torch.Tensor
-    fp8_cache: torch.Tensor
-    block_tables: torch.Tensor
-    seq_lens: torch.Tensor
-    workspace: torch.Tensor
-    page_size: int
-    max_seq_len: int
-    is_var_seq: bool
+@pytest.fixture(scope="module", autouse=True)
+def exclusive_gpu():
+    start()
+    torch.set_num_threads(4)
+    torch.backends.cuda.matmul.allow_tf32 = False
 
 
-def _skip_if_unsupported() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required")
-    device = torch.device("cuda")
-    if not (is_sm100a_supported(device) or is_sm110a_supported(device)):
-        pytest.skip("Per-token-scaled FP4 MLA requires SM100-SM110 (tcgen05)")
-    if not is_cute_dsl_available():
-        pytest.skip("CuTe DSL is not available")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float8_e4m3fn])
+def test_quantization(dtype):
+    check()
+    torch.manual_seed(391)
+    x = torch.randn(2, 192, 512, device="cuda").to(dtype)
+    x[:, 0] = 0
+    payload, scales = quantize(x)
+    expected = nvfp4(x)
+    assert torch.equal(payload, expected.packed)
+    assert torch.equal(scales.view(torch.uint8), expected.sf.view(torch.uint8))
+    allocated = (torch.empty_like(payload), torch.empty_like(scales))
+    reused = quantize(x, output=allocated)
+    assert reused[0] is allocated[0] and reused[1] is allocated[1]
+    assert torch.equal(reused[0], payload)
+    assert torch.equal(reused[1].view(torch.uint8), scales.view(torch.uint8))
 
 
-@torch.no_grad()
-def _make_w512_cache(
-    source: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pack latent E2M1 and return a materialized E4M3 reference cache."""
-
-    num_pages, page_size, _ = source.shape
-    token_ids = torch.arange(
-        num_pages * page_size,
-        dtype=torch.int64,
-        device=source.device,
-    ).view(num_pages, page_size)
-    token_scale = torch.where(token_ids % 2 == 0, 0.5, 1.0)[..., None].float()
-
-    normalized = source[..., :LATENT_DIM].float() / token_scale
-    thresholds = torch.tensor(
-        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
-        dtype=torch.float32,
-        device=source.device,
-    )
-    magnitude_codes = torch.bucketize(normalized.abs(), thresholds)
-    nibbles = magnitude_codes | ((normalized < 0).to(torch.int64) << 3)
-    packed = (nibbles[..., 0::2] | (nibbles[..., 1::2] << 4)).to(torch.uint8)
-
-    magnitude_lut = torch.tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
-        dtype=torch.float32,
-        device=source.device,
-    )
-    latent = (
-        magnitude_lut[magnitude_codes]
-        * torch.where(normalized < 0, -1.0, 1.0)
-        * token_scale
-    )
-    rope = source[..., LATENT_DIM:].to(torch.float8_e4m3fn)
-    fp4_cache = torch.cat((packed, rope.view(torch.uint8)), dim=-1).contiguous()
-    fp8_cache = torch.cat((latent, rope.float()), dim=-1).to(torch.float8_e4m3fn)
-    return fp4_cache, token_scale, fp8_cache
-
-
-def _make_case(
-    batch_size: int,
-    seq_len: int,
-    page_size: int,
-    is_var_seq: bool,
-    num_heads: int = 128,
-) -> _Case:
-    device = torch.device("cuda")
-    logical_dim = LATENT_DIM + ROPE_DIM
-    pages_per_batch = (seq_len + page_size - 1) // page_size
-    total_pages = batch_size * pages_per_batch + 2
-
-    query = (
-        torch.randn(
-            batch_size,
-            1,
-            num_heads,
-            logical_dim,
-            dtype=torch.float16,
-            device=device,
-        )
-        * 0.1
-    ).to(torch.float8_e4m3fn)
-    source = torch.randn(
-        total_pages,
-        page_size,
-        logical_dim,
-        dtype=torch.float16,
-        device=device,
-    )
-    fp4_cache, token_scale, fp8_cache = _make_w512_cache(source)
-
-    expected_bytes = total_pages * page_size * (LATENT_DIM // 2 + ROPE_DIM + 4)
-    assert fp4_cache.nbytes + token_scale.nbytes == expected_bytes
-    assert expected_bytes / (total_pages * page_size * logical_dim) < 0.565
-
-    block_tables = torch.arange(
-        batch_size * pages_per_batch,
-        dtype=torch.int32,
-        device=device,
-    ).view(batch_size, pages_per_batch)
-    if is_var_seq:
-        seq_lens = torch.tensor(
-            [max(1, seq_len - 1 - i * 17) for i in range(batch_size)],
-            dtype=torch.int32,
-            device=device,
-        )
-        fp4_cache = fp4_cache.unsqueeze(1)
-        token_scale = token_scale.unsqueeze(1)
-        fp8_cache = fp8_cache.unsqueeze(1)
-    else:
-        seq_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
-
-    return _Case(
-        query=query,
-        fp4_cache=fp4_cache,
-        token_scale=token_scale,
-        fp8_cache=fp8_cache,
-        block_tables=block_tables,
-        seq_lens=seq_lens,
-        workspace=torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device),
-        page_size=page_size,
-        max_seq_len=int(seq_lens.max().item()),
-        is_var_seq=is_var_seq,
-    )
-
-
-def _plan(case: _Case):
-    common = dict(
-        kv_lora_rank=LATENT_DIM,
-        qk_rope_head_dim=ROPE_DIM,
-        num_heads=case.query.size(2),
-        page_size=case.page_size,
-        q_dtype=case.query.dtype,
-        out_dtype=torch.bfloat16,
-        is_var_seq=case.is_var_seq,
-        enable_pdl=False,
-    )
-    fp4_wrapper = BatchMLADecodeCuteDSLFP4Wrapper(case.workspace)
-    fp4_wrapper.plan(**common, kv_dtype=torch.uint8)
-    fp8_wrapper = BatchMLADecodeCuteDSLWrapper(case.workspace)
-    fp8_wrapper.plan(**common)
-    return fp4_wrapper, fp8_wrapper
-
-
-def _run(wrapper, case: _Case, cache, token_scale=None, out=None):
-    if out is None:
-        out = torch.empty(
-            case.query.size(0),
-            1,
-            case.query.size(2),
-            LATENT_DIM,
-            dtype=torch.bfloat16,
-            device=case.query.device,
-        )
-    scale_kwargs = {} if token_scale is None else {"kv_cache_sf": token_scale}
-    wrapper.run(
-        q=case.query,
-        kv_cache=cache,
-        block_tables=case.block_tables,
-        seq_lens=case.seq_lens,
-        max_seq_len=case.max_seq_len,
-        softmax_scale=1.0 / (LATENT_DIM**0.5),
-        out=out,
-        **scale_kwargs,
-    )
-    return out
-
-
-@pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("seq_len", [128, 512, 2048])
-@pytest.mark.parametrize("page_size", [32, 64, 128])
-@pytest.mark.parametrize("is_var_seq", [False, True])
-def test_cute_dsl_mla_decode_fp4_accuracy(
-    batch_size: int,
-    seq_len: int,
-    page_size: int,
-    is_var_seq: bool,
-) -> None:
-    """Compare per-token-scaled FP4 against the same cache materialized as E4M3."""
-
-    _skip_if_unsupported()
-    torch.manual_seed(42)
-    case = _make_case(batch_size, seq_len, page_size, is_var_seq)
-    fp4_wrapper, fp8_wrapper = _plan(case)
-    fp4_output = _run(fp4_wrapper, case, case.fp4_cache, case.token_scale)
-    fp8_output = _run(fp8_wrapper, case, case.fp8_cache)
-
-    assert fp4_output.shape == (batch_size, 1, 128, LATENT_DIM)
-    assert fp4_output.dtype == torch.bfloat16
-    assert torch.isfinite(fp4_output).all()
-    torch.testing.assert_close(
-        fp4_output.float(),
-        fp8_output.float(),
-        atol=1.5e-3,
-        rtol=0,
-    )
-
-
-def test_cute_dsl_mla_decode_fp4_performance() -> None:
-    """Report one warm-L2 FP4-vs-FP8 latency point and catch gross regressions."""
-
-    _skip_if_unsupported()
-    torch.manual_seed(42)
-    batch_size, seq_len, page_size, num_heads = 4, 4096, 64, 64
-    case = _make_case(batch_size, seq_len, page_size, False, num_heads)
-    fp4_wrapper, fp8_wrapper = _plan(case)
-    fp4_output = _run(fp4_wrapper, case, case.fp4_cache, case.token_scale)
-    fp8_output = _run(fp8_wrapper, case, case.fp8_cache)
+@pytest.mark.parametrize("batch,seq,heads,splits,valid,permuted,kind", [
+    (1, 64, 128, 1, None, False, "normal"),
+    (2, 192, 128, 4, None, False, "normal"),
+    (3, 512, 128, 4, [1, 129, 511], True, "normal"),
+    (4, 4096, 128, 8, [127, 2048, 4095, 4096], True, "normal"),
+    (1, 16384, 128, 1, None, False, "normal"),
+    (4, 4096, 128, 16, None, True, "normal"),
+    (1, 64, 128, 32, [1], True, "normal"),
+    (2, 256, 128, 3, [16, 65], True, "normal"),
+    (3, 320, 128, 8, [17, 63, 257], True, "normal"),
+    (4, 4160, 128, 12, [4097, 15, 128, 4160], True, "normal"),
+    *[(2, 192, h, s, [63, 129], True, "normal")
+      for h, s in ((8, 1), (16, 3), (32, 4), (64, 8))],
+    (2, 4096, 128, 4, None, True, "sharp"),
+    (2, 4096, 128, 4, None, True, "mixed"),
+])
+def test_decode(batch, seq, heads, splits, valid, permuted, kind):
+    check()
+    torch.manual_seed(9371)
+    x = torch.randn(batch, seq, 512, device="cuda")
+    query = torch.randn(batch, heads, 512, device="cuda")
+    if kind == "sharp":
+        query *= 3
+    if kind == "mixed":
+        x *= torch.exp2(torch.linspace(-5, 1, seq, device="cuda"))[None, :, None]
+    x[:, 0] = 0
+    x, query = x.to(torch.float8_e4m3fn), query.to(torch.float8_e4m3fn)
+    qr = torch.randn(batch, heads, 64, device="cuda").to(torch.float8_e4m3fn)
+    rope = torch.randn(batch, seq, 64, device="cuda").to(torch.float8_e4m3fn)
+    q, qs = quantize(query)
+    k, ks = quantize(x)
+    lengths = torch.tensor(valid or [seq] * batch, device="cuda", dtype=torch.int32)
+    expected = reference(q, qs, qr, k, ks, rope, lengths, splits)
+    runner = Runner(q, qs, qr, k, ks, rope, lengths, splits=splits)
+    if permuted:
+        order = torch.randperm(runner.k.shape[0], device="cuda")
+        runner.k, runner.r, runner.ks = [value[order] for value in
+                                        (runner.k, runner.r, runner.ks)]
+        runner.tables = order.argsort()[runner.tables.long()].to(torch.int32)
+    actual = runner().clone()
+    error = (actual.float() - expected).norm() / expected.norm().clamp_min(1e-20)
+    assert torch.isfinite(actual).all() and error < .006, error.item()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = runner()
+    for _ in range(30):
+        graph.replay()
     torch.cuda.synchronize()
-    torch.testing.assert_close(
-        fp4_output.float(), fp8_output.float(), atol=1.5e-3, rtol=0
+    torch.testing.assert_close(output, actual, rtol=0, atol=0)
+    runner.qr.copy_((runner.qr.float() * .5).to(torch.float8_e4m3fn))
+    updated = runner().clone()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, updated, rtol=0, atol=0)
+
+
+@cute.kernel
+def _convert(codes, scales, output):
+    index = cute.arch.block_idx()[0] * 128 + cute.arch.thread_idx()[0]
+    if index < codes.shape[0]:
+        output[index] = _dequantize_e2m1x8(codes[index], scales[index])
+
+
+@cute.jit
+def _launch_convert(codes, scales, output, stream):
+    _convert(codes, scales, output).launch(
+        grid=(cute.ceil_div(codes.shape[0], 128), 1, 1),
+        block=(128, 1, 1), stream=stream,
     )
 
-    def measure(fn) -> float:
-        return float(
-            median(
-                bench_gpu_time(
-                    fn,
-                    dry_run_iters=5,
-                    repeat_iters=20,
-                    use_cuda_graph=True,
-                    cold_l2_cache=False,
-                )
-            )
-        )
 
-    fp8_ms = measure(lambda: _run(fp8_wrapper, case, case.fp8_cache, out=fp8_output))
-    fp4_ms = measure(
-        lambda: _run(
-            fp4_wrapper,
-            case,
-            case.fp4_cache,
-            case.token_scale,
-            fp4_output,
-        )
+def test_packed_conversion():
+    check()
+    # Every E2M1 byte, crossed with every nonnegative finite E4M3 scale.
+    byte = torch.arange(256, device="cuda", dtype=torch.int64).repeat(127)
+    scales = torch.arange(127, device="cuda", dtype=torch.uint8).view(torch.float8_e4m3fn)
+    scales = scales.float().repeat_interleave(256)
+    codes = (byte * 0x01010101).to(torch.uint32)
+    output = torch.empty(codes.shape[0], device="cuda", dtype=torch.uint64)
+    count = cute.sym_int()
+
+    def fake(dtype):
+        return cute.runtime.make_fake_compact_tensor(dtype, (count,), assumed_align=16)
+
+    compiled = cute.compile(
+        _launch_convert, fake(cutlass.Uint32), fake(cutlass.Float32),
+        fake(cutlass.Uint64),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi --opt-level 2",
     )
-    ratio = fp4_ms / fp8_ms
-    print(
-        f"warm-L2 B={batch_size} S={seq_len} H={num_heads} page={page_size}: "
-        f"FP8={fp8_ms * 1000:.3f} us, FP4={fp4_ms * 1000:.3f} us, "
-        f"speedup={fp8_ms / fp4_ms:.3f}x"
-    )
-    assert fp8_ms > 0 and fp4_ms > 0
-    assert ratio < 2.0, f"FP4 warm-L2 latency regressed: FP4/FP8={ratio:.3f}x"
+    compiled(codes, scales, output)
+    expected = (unpack(codes.view(torch.uint8).reshape(-1, 4)) * scales[:, None])
+    expected = expected.clamp(-448, 448).to(torch.float8_e4m3fn)
+    torch.cuda.synchronize()
+    assert torch.equal(output.view(torch.uint8).reshape(-1, 8), expected.view(torch.uint8))

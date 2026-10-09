@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Softmax/compute role for per-token-scaled FP4 MLA decode."""
+"""Assemble native QK scores and quantize probabilities into E4M3 P."""
 
 import math
 from types import SimpleNamespace
@@ -27,13 +27,12 @@ from ..mla_config_fp4 import MLAConfigFP4
 
 
 class MLAComputeFP4Role(MLAComputeRole):
-    """Reuse common MLA metadata exchange with per-token FP4 score scaling."""
+    """Reuse MLA metadata exchange with E4M3 probabilities for FP8 PV."""
 
-    def __init__(self, config: MLAConfigFP4, fusion: AttentionFusion):
+    def __init__(self, config: MLAConfigFP4, fusion: AttentionFusion, softmax_regs=216):
         super().__init__(config, fusion)
-        self.use_token_scale = True
         self.num_scale_groups = config.num_scale_groups
-        self.softmax_reg_num = 240
+        self.softmax_reg_num = softmax_regs
 
     @cute.jit
     def _store_p(
@@ -88,7 +87,6 @@ class MLAComputeFP4Role(MLAComputeRole):
         common_params: SimpleNamespace,
         softmax_params: SimpleNamespace,
         k_index: cutlass.Int32,
-        mma_s_handle,
         mma_s_consumer: PipelineConsumer,
         scale_handle,
         first_p_mma_handle,
@@ -114,9 +112,10 @@ class MLAComputeFP4Role(MLAComputeRole):
         Side effects co-located with their paired fences:
         - fence_view_async_shared → p_mma_handle.commit()
         - fence_view_async_tmem_store → p_cor_handle.commit() (via exchange)
-        - fence_view_async_tmem_load → mma_s_handle.release()
+        - fence_view_async_tmem_load → score handle release
 
-        Returns (row_max_new, row_sum, correction_factor).
+        Returns the statistics and advanced score consumer so CuTe tracks
+        the nested pipeline update as loop-carried state.
         """
 
         # load S from tmem
@@ -127,10 +126,7 @@ class MLAComputeFP4Role(MLAComputeRole):
             cute.append(tStS_shape, self.mma_s_stage)
         )
         tStS_staged = cute.make_tensor(common_params.tmem_ptr, tStS_staged_fake.layout)
-        score_stage_index = (
-            0 if cutlass.const_expr(self.use_token_scale) else mma_s_handle.index
-        )
-        tStS = tStS_staged[None, None, None, score_stage_index]
+        tStS = tStS_staged[None, None, None, 0]
 
         tAcc = tStS[(None, None), 0, 0]
         cta_qk_tiler = (
@@ -148,7 +144,6 @@ class MLAComputeFP4Role(MLAComputeRole):
         tidx = common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
 
         tmem_thr_copy = tmem_tiled_copy.get_slice(tidx)
-        tTR_tAcc = tmem_thr_copy.partition_S(tAcc)
         tTR_tS = tmem_thr_copy.partition_D(cS)
 
         # Inject virtual tokens into running (m, d) before loading scores
@@ -165,122 +160,45 @@ class MLAComputeFP4Role(MLAComputeRole):
             )
 
         tTR_rAcc = cute.make_fragment_like(tTR_tS, self.acc_dtype)
-        tTR_rPartial = (
-            cute.make_fragment_like(tTR_tS, self.acc_dtype)
-            if cutlass.const_expr(self.use_token_scale)
-            else None
-        )
-        tTR_rTokenScale = (
-            cute.make_rmem_tensor(
-                cute.make_layout((cute.size(tTR_tS),)),
-                self.acc_dtype,
-            )
-            if cutlass.const_expr(self.use_token_scale)
-            else None
-        )
-        if cutlass.const_expr(self.use_token_scale):
-            # Each compute warp owns one contiguous 64-token score slice.
-            # Load that slice with vector LDS instructions; all lanes request
-            # the same addresses, so shared memory broadcasts each vector.
-            assert self.num_scale_groups == 1
-            assert cute.size(tTR_tS) == 2 * self.threads_per_warp
-            token_base = tTR_tS[0][1]
-            sTokenScaleTile = cute.make_tensor(
-                softmax_params.sTokenScale.iterator
-                + token_base * softmax_params.sTokenScale.stride[0]
-                + scale_handle.index * softmax_params.sTokenScale.stride[2],
-                cute.make_layout((cute.size(tTR_tS),)),
-            )
-            cute.autovec_copy(sTokenScaleTile, tTR_rTokenScale)
+        tTR_rPartial = cute.make_fragment_like(tTR_tS, self.acc_dtype)
         row_max_new = row_max
         arch = BaseDSL._get_dsl().get_arch_enum()
-        if cutlass.const_expr(self.use_token_scale):
-            assert self.num_scale_groups == 1
-            latent_handle = mma_s_consumer.wait_and_advance()
-            tLatent = tStS_staged[None, None, None, latent_handle.index][
-                (None, None), 0, 0
-            ]
-            tTR_tLatent = tmem_thr_copy.partition_S(tLatent)
-            cute.copy(tmem_tiled_copy, tTR_tLatent, tTR_rPartial)
-            cute.arch.fence_view_async_tmem_load()
-            latent_handle.release()
-
-            # Load the independent E4M3 RoPE score directly into the result
-            # fragment, then fuse latent * token_scale + rope in one FMA.
-            rope_handle = mma_s_consumer.wait_and_advance()
-            tRope = tStS_staged[None, None, None, rope_handle.index][(None, None), 0, 0]
-            tTR_tRope = tmem_thr_copy.partition_S(tRope)
-            cute.copy(tmem_tiled_copy, tTR_tRope, tTR_rAcc)
-            cute.arch.fence_view_async_tmem_load()
-            rope_handle.release()
-            for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
-                token_scale_0 = tTR_rTokenScale[i]
-                token_scale_1 = tTR_rTokenScale[i + 1]
-                tTR_rAcc[i], tTR_rAcc[i + 1] = cute.arch.fma_packed_f32x2(
-                    (tTR_rPartial[i], tTR_rPartial[i + 1]),
-                    (token_scale_0, token_scale_1),
-                    (tTR_rAcc[i], tTR_rAcc[i + 1]),
-                )
-
-            if is_last_tile:
-                for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
-                    kv_idx = tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index
-                    if not cute.elem_less(kv_idx, common_params.K):
-                        tTR_rAcc[i] = -self.acc_dtype.inf
-            row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
-
-        elif cutlass.const_expr(arch >= Arch.sm_100 and arch <= Arch.sm_100f):
-            cute.copy(tmem_tiled_copy, tTR_tAcc, tTR_rAcc)
-            for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
-                if is_last_tile:
-                    tTR_rAcc[i] = (
-                        tTR_rAcc[i]
-                        if cute.elem_less(
-                            tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
-                            common_params.K,
-                        )
-                        else -self.acc_dtype.inf
-                    )
-            row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
-
-        elif cutlass.const_expr(arch >= Arch.sm_103 and arch <= Arch.sm_103f):
-            tmem_load_red_atom = cute.make_copy_atom(
+        latent_handle = mma_s_consumer.wait_and_advance()
+        tLatent = tStS_staged[None, None, None, latent_handle.index][
+            (None, None), 0, 0
+        ]
+        tTR_tLatent = tmem_thr_copy.partition_S(tLatent)
+        if cutlass.const_expr(arch >= Arch.sm_103 and arch <= Arch.sm_103f):
+            red_atom = cute.make_copy_atom(
                 tcgen05.copy.LdRed32x32bOp(
                     tcgen05.copy.Repetition(self.mma_qk_tiler[1] // 2),
-                    redOp=tcgen05.TmemLoadRedOp.MAX,
-                ),
-                self.acc_dtype,
-            )
-            tmem_red_tiled_copy = tcgen05.make_tmem_copy(tmem_load_red_atom, tAcc)
-            tmem_red_thr_copy = tmem_red_tiled_copy.get_slice(tidx)
-            tTR_tAcc_red = tmem_red_thr_copy.partition_S(tAcc)
-            tTR_tS_red = tmem_red_thr_copy.partition_D(cS)
-            tTR_rAcc_red = cute.make_fragment_like(tTR_tS_red, self.acc_dtype)
-            tTR_rMax = cute.make_rmem_tensor(
-                cute.make_layout((1, tTR_tS_red.shape[1], tTR_tS_red.shape[2])),
-                self.acc_dtype,
-            )
-            cute.copy(
-                tmem_red_tiled_copy,
-                tTR_tAcc_red,
-                (tTR_rAcc_red, tTR_rMax),
-            )
-            tTR_rAcc = cute.make_tensor(tTR_rAcc_red.iterator, tTR_rAcc.layout)
-            if is_last_tile:
-                for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
-                    tTR_rAcc[i] = (
-                        tTR_rAcc[i]
-                        if cute.elem_less(
-                            tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
-                            common_params.K,
-                        )
-                        else -self.acc_dtype.inf
-                    )
-                row_max_new = tTR_rAcc.load().reduce(
-                    cute.ReductionOp.MAX, row_max_new, 0
-                )
-            else:
-                row_max_new = cute.arch.fmax(row_max_new, tTR_rMax[0])
+                    redOp=tcgen05.TmemLoadRedOp.MAX), self.acc_dtype)
+            red_copy = tcgen05.make_tmem_copy(red_atom, tLatent)
+            red_thr = red_copy.get_slice(tidx)
+            red_src = red_thr.partition_S(tLatent)
+            red_coords = red_thr.partition_D(cS)
+            red_values = cute.make_fragment_like(red_coords, self.acc_dtype)
+            red_max = cute.make_rmem_tensor(
+                cute.make_layout((1, red_coords.shape[1], red_coords.shape[2])),
+                self.acc_dtype)
+            cute.copy(red_copy, red_src, (red_values, red_max))
+            tTR_rAcc = cute.make_tensor(red_values.iterator, tTR_rAcc.layout)
+            row_max_new = cute.arch.fmax(row_max_new, red_max[0])
+        else:
+            cute.copy(tmem_tiled_copy, tTR_tLatent, tTR_rAcc)
+        cute.arch.fence_view_async_tmem_load()
+        latent_handle.release()
+
+        if is_last_tile:
+            for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+                kv_idx = tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index
+                if not cute.elem_less(kv_idx, common_params.K):
+                    tTR_rAcc[i] = -self.acc_dtype.inf
+            # LdRed saw the padding before masking; discard that maximum
+            # and recompute it from masked scores and the previous max.
+            row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max, 0)
+        elif cutlass.const_expr(not (arch >= Arch.sm_103 and arch <= Arch.sm_103f)):
+            row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
 
         # Per-element score modification (e.g. ALiBi bias, soft-capping).
         # Applied after masking, before row_max finalization.  When active,
@@ -360,34 +278,14 @@ class MLAComputeFP4Role(MLAComputeRole):
         row_sum = row_sum_vec[0] + row_sum_vec[1] + row_sum
 
         tTR_rS = cute.make_fragment_like(tTR_tS, self.q_dtype)
-        if cutlass.const_expr(self.use_token_scale):
-            assert self.num_scale_groups == 1
-            for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
-                token_scale_0 = tTR_rTokenScale[i]
-                token_scale_1 = tTR_rTokenScale[i + 1]
-                tTR_rPartial[i], tTR_rPartial[i + 1] = cute.arch.mul_packed_f32x2(
-                    (tTR_rAcc[i], tTR_rAcc[i + 1]),
-                    (token_scale_0, token_scale_1),
-                )
-            tTR_rS.store(tTR_rPartial.load().to(self.q_dtype))
-            self._store_p(
-                softmax_params,
-                tTR_rS,
-                tmem_tiled_copy,
-                tidx,
-                first_p_mma_handle,
-            )
-            scale_handle.release()
-
-        else:
-            tTR_rS.store(tTR_rAcc.load().to(self.q_dtype))
-            self._store_p(
-                softmax_params,
-                tTR_rS,
-                tmem_tiled_copy,
-                tidx,
-                first_p_mma_handle,
-            )
+        tTR_rS.store(tTR_rAcc.load().to(self.q_dtype))
+        self._store_p(
+            softmax_params,
+            tTR_rS,
+            tmem_tiled_copy,
+            tidx,
+            first_p_mma_handle,
+        )
         # split kv case: exchange metadata on last tile
         if cutlass.const_expr(is_local_last_tile):
             row_max_new = self.exchange_p_cor_metadata(
@@ -402,22 +300,20 @@ class MLAComputeFP4Role(MLAComputeRole):
                 p_cor_handle,
             )
 
-        if cutlass.const_expr(not self.use_token_scale):
-            cute.arch.fence_view_async_tmem_load()
-            mma_s_handle.release()
 
         return (
             row_max_new,
             row_sum,
             correction_factor,
+            mma_s_consumer,
         )
 
     # ------------------------------------------------------------------
     # run — top-level entry: pipeline init + tile scheduler loop
     #
-    # State transitions (acquire_and_advance, wait_and_advance) live here.
-    # ImmutableResourceHandles are passed to sub-methods where side
-    # effects (commit, release) are co-located with their paired fences.
+    # Acquire P/scale handles here; wait for scores after scale loading
+    # inside softmax. Return its advanced consumer explicitly to the loop.
+    # Commit/release stay co-located with their paired fences.
     # ------------------------------------------------------------------
 
     @cute.jit
@@ -444,11 +340,12 @@ class MLAComputeFP4Role(MLAComputeRole):
         softmax_scale_log2: cutlass.Float32,
         tmem,
         params: cute.Tensor = None,
+        qk_global_scale: cutlass.Float32 = 1.0,
     ):
         """Top-level entry for the compute warp role.
 
         Iterates the tile scheduler and runs softmax for each valid work
-        tile. State transitions (acquire/wait) happen here; commit/release
+        tile. Score-consumer state is returned by softmax; commit/release
         are co-located with fences inside softmax/exchange_p_cor_metadata.
         """
         _setmaxregister_increase(self.softmax_reg_num)
@@ -492,6 +389,7 @@ class MLAComputeFP4Role(MLAComputeRole):
                     sP=sP,
                     softmax_scale_log2=softmax_scale_log2,
                     sTokenScale=sTokenScale,
+                    qk_global_scale=qk_global_scale,
                 )
                 k_tile_total = cute.ceil_div(
                     compute_common_params.K, self.mma_qk_tiler[1]
@@ -505,26 +403,17 @@ class MLAComputeFP4Role(MLAComputeRole):
                 # unmasked tiles
                 while k_tile_count > 1:
                     first_p_mma_handle = p_mma_producer.acquire_and_advance()
-                    mma_s_handle = (
-                        None
-                        if cutlass.const_expr(self.use_token_scale)
-                        else mma_s_consumer.wait_and_advance()
-                    )
-                    scale_handle = (
-                        load_scale_consumer.wait_and_advance()
-                        if cutlass.const_expr(self.use_token_scale)
-                        else None
-                    )
+                    scale_handle = None
 
                     (
                         row_max,
                         row_sum,
                         correction_factor,
+                        mma_s_consumer,
                     ) = self.softmax(
                         compute_common_params,
                         compute_softmax_params,
                         k_index,
-                        mma_s_handle,
                         mma_s_consumer,
                         scale_handle,
                         first_p_mma_handle,
@@ -545,27 +434,18 @@ class MLAComputeFP4Role(MLAComputeRole):
 
                 # last tile (masked)
                 first_p_mma_handle = p_mma_producer.acquire_and_advance()
-                mma_s_handle = (
-                    None
-                    if cutlass.const_expr(self.use_token_scale)
-                    else mma_s_consumer.wait_and_advance()
-                )
-                scale_handle = (
-                    load_scale_consumer.wait_and_advance()
-                    if cutlass.const_expr(self.use_token_scale)
-                    else None
-                )
+                scale_handle = None
 
                 if cutlass.const_expr(mAccO is not None):
                     (
                         row_max,
                         row_sum,
                         correction_factor,
+                        mma_s_consumer,
                     ) = self.softmax(
                         compute_common_params,
                         compute_softmax_params,
                         k_index,
-                        mma_s_handle,
                         mma_s_consumer,
                         scale_handle,
                         first_p_mma_handle,
@@ -583,11 +463,11 @@ class MLAComputeFP4Role(MLAComputeRole):
                         row_max,
                         row_sum,
                         correction_factor,
+                        mma_s_consumer,
                     ) = self.softmax(
                         compute_common_params,
                         compute_softmax_params,
                         k_index,
-                        mma_s_handle,
                         mma_s_consumer,
                         scale_handle,
                         first_p_mma_handle,

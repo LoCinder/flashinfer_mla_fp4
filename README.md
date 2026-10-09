@@ -1,137 +1,112 @@
-# flashinfer_mla_fp4
+# FlashInfer MLA FP4 Fused Dequantization
 
-A standalone FlashInfer sidecar providing an FP4 MLA decode kernel adapted
-from FlashInfer's modular FP8 `cutedsl_mla` implementation. Its KV cache stores
-a 512-dimensional E2M1 latent vector with one FP32 scale per token and a
-separate 64-dimensional E4M3 RoPE vector. This is a custom cache format, not
-the standard NVFP4 block-scaled format. The package does not patch or replace
-the installed FlashInfer package.
+An experimental CuTe DSL MLA decode package adapted from FlashInfer's modular
+FP8 implementation. QK uses native block-scaled NVFP4 MMA. For PV, the same
+NVFP4 latent is dequantized into FP8 shared memory inside the decode kernel,
+then consumed by FP8 × FP8 MMA. No second KV payload or global FP8 temporary
+cache is required; RoPE remains E4M3.
 
-## Requirements
-
-- Python 3.10
-- `flashinfer-python==0.6.17`
-- A tcgen05-capable NVIDIA Blackwell GPU; validated on B300 (SM103)
-- A working CUDA, PyTorch, and NVIDIA CuTe DSL environment
-
-The FlashInfer version is checked at import time because this package inherits
-internal FlashInfer CuTe DSL classes.
+This is a research baseline, separate from the per-token-scaled implementation
+on `main` and the shared-payload/dual-scale implementation on
+`native_nvfp4_qk`. It does not patch FlashInfer or integrate with SGLang.
+The three Python packages can coexist.
 
 ## Install
 
+In an existing Linux CUDA environment with FlashInfer 0.6.17, PyTorch, Triton
+and CuTe DSL installed:
+
 ```bash
-git clone https://github.com/LoCinder/flashinfer_mla_fp4.git
-cd flashinfer_mla_fp4
+git clone --branch fused_dequant_pv --single-branch \
+  https://github.com/LoCinder/flashinfer_mla_fp4.git flashinfer_mla_fp4_fused_dequant
+cd flashinfer_mla_fp4_fused_dequant
 pip install -e .
 ```
 
-## Cache format
+FlashInfer 0.6.17 is checked at import time. Installation does not install,
+upgrade or downgrade runtime dependencies. The optimization measurements used
+B300 (SM103), CUTLASS DSL 4.6.2 and PyTorch 2.13 with CUDA 13.0.
 
-The currently supported configuration is:
-
-- Latent dimension: 512 packed E2M1 values
-- RoPE dimension: 64 E4M3 values
-- Scale: one FP32 value per token
-- Query length: 1; longer queries can be added via `fold_sq`
-- Query: E4M3 with shape `[batch, 1, heads, 576]`
-- Output: BF16 by default with shape `[batch, 1, heads, 512]`
-
-The packed cache has shape `[pages, page_size, 320]` and dtype `torch.uint8`:
-the first 256 bytes contain the packed latent values and the final 64 bytes
-contain the E4M3 RoPE values. The scale tensor has shape
-`[pages, page_size, 1]` and dtype `torch.float32`.
-
-## Usage
-
-Assuming the query, packed cache, scale tensor, page table, and sequence
-lengths have already been prepared:
-
-```python
-import torch
-
-from flashinfer_mla_fp4 import BatchMLADecodeCuteDSLFP4Wrapper
-
-workspace = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda")
-wrapper = BatchMLADecodeCuteDSLFP4Wrapper(workspace)
-wrapper.plan(
-    kv_lora_rank=512,
-    qk_rope_head_dim=64,
-    num_heads=q.shape[2],
-    page_size=64,
-    q_dtype=torch.float8_e4m3fn,
-    out_dtype=torch.bfloat16,
-    is_var_seq=True,
-    kv_dtype=torch.uint8,
-)
-
-output = wrapper.run(
-    q=q,
-    kv_cache=kv_cache,
-    kv_cache_sf=kv_cache_sf,
-    block_tables=block_tables,
-    seq_lens=seq_lens,
-    max_seq_len=int(seq_lens.max().item()),
-    softmax_scale=1.0 / (512**0.5),
-)
-```
-
-The first `plan` call compiles the required specialization. Later wrappers in
-the same process reuse the compilation cache.
-
-This package contains only the FP4 MLA decode path. KV cache quantization,
-cache writes, prefill handling, and SGLang backend routing remain the caller's
-responsibility.
-
-## Test
+## Run
 
 ```bash
-pytest -q -s tests/test_cute_dsl_mla_fp4.py
+CUDA_VISIBLE_DEVICES=0 python examples/decode.py
 ```
 
-The test suite compares FP4 output against the corresponding materialized FP8
-cache across multiple shapes and reports one small warm-L2 performance point.
+The example quantizes Q and KV before constructing the runner:
 
-## Results
+```python
+from flashinfer_mla_fp4_fused_dequant import Runner
 
-The FP8 baseline in this section uses FlashInfer's `cutedsl_mla` decode path.
+runner = Runner(q, q_scales, q_rope, payload, kv_scales, kv_rope,
+                lengths, splits=8)
+output = runner()
+```
 
-### Kernel accuracy
+Inputs are contiguous CUDA tensors:
 
-Measured on Kimi-K2.6 with KV length 1024 and query length 1. The metrics are
-averaged across all MLA layers relative to an FP8 baseline. This implementation
-has lower attention-output error than dequantizing NVFP4 to FP8, with slightly
-higher KV write error. MXFP4-to-FP8 has the largest output error.
+- Q: `[B, H, 256]` uint8 packed E2M1; Q scales: `[B, H, 32]` E4M3.
+- KV payload: `[B, S, 256]` uint8; KV scales: `[B, S, 32]` E4M3.
+- Q/KV RoPE: `[B, H, 64]` / `[B, S, 64]` E4M3.
+- Valid lengths: `[B]` int32, between 1 and S.
+- Output: `[B, H, 512]` BF16, backed by a reused output buffer.
 
-| Path | Mean cosine ↑ | Mean L2 error ↓ | Mean KV L2 error ↓ |
-|---|---:|---:|---:|
-| Per-token-scaled FP4 (this implementation) | **0.986437** | **0.157104** | 0.114018 |
-| NVFP4 → FP8 | 0.985614 | 0.175141 | **0.095618** |
-| MXFP4 → FP8 | 0.975980 | 0.233607 | 0.116849 |
+Each latent block of 16 values has an E4M3 scale. Global scales are fixed to 1.
+The helper `quantization.quantize.quantize` prepares this format from
+FP32/BF16/FP8 inputs. Scales are linear by default; prepacked page64 KV scales
+can be passed with `input_sf_packed=True`.
 
-### Kernel latency
+The constructor compiles, packs scales, allocates workspace/output and creates
+a sequential page table. Construct it outside CUDA Graph capture or timing;
+repeated `runner()` calls reuse these buffers. This is an operator-only
+research interface, not a serving `plan()/run()` wrapper.
 
-Measured on one B300 GPU with 64 query heads, page size 64, and cold L2. Each
-cell reports FP8 → FP4 latency in microseconds and the FP4 latency change;
-negative values mean FP4 is faster.
+Scope: Q length 1, latent 512, RoPE 64, H=8/16/32/64/128, page size 64.
+Storage must be page-padded; valid lengths mask padded tokens. Validation and
+performance measurements target B300; no SM120 support is claimed.
 
-| Batch \ Seq | 4096 | 8192 | 16384 | 32768 |
-|---:|---:|---:|---:|---:|
-| 4 | 14.278→13.461 (-5.7%) | 16.317→16.110 (-1.3%) | 19.598→19.810 (+1.1%) | 26.789→26.347 (-1.6%) |
-| 8 | 15.914→15.909 (-0.0%) | 19.091→19.392 (+1.6%) | 26.149→25.744 (-1.5%) | 38.854→37.726 (-2.9%) |
+## Tests
 
-### End-to-end validation
+With pytest installed, select one idle GPU:
 
-We integrated this kernel into our private SGLang fork and validated FP4
-KV cache serving on Kimi-K2.6 (DPA=8) and Kimi-K3 (DCP=8). Single-request
-latency stayed within ±3% of the FP8 baseline.
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m pytest -q tests/test_cute_dsl_mla_fp4.py
+```
 
-GPQA-Diamond accuracy averaged over eight runs:
+The suite covers quantization for three input dtypes, 16 decode/reference cases,
+page permutations, ragged lengths, empty splits, H=8/16/32/64/128, 30 CUDA Graph
+replays and updates to captured input buffers. An exhaustive packed-conversion
+test checks all E2M1 bytes against all nonnegative finite E4M3 scales.
 
-| Configuration | FP8 baseline | FP4 | Change |
-|---|---:|---:|---:|
-| Kimi-K2.6 | 90.5% | 89.7% | -0.8 pp |
-| Kimi-K3 | 93.5% | 93.1% | -0.4 pp |
+The GPU guard refuses an occupied GPU and stops only its own process if another
+workload appears.
 
-## License
+## Performance
 
-Kernel sources are BSD-3-Clause; the FlashInfer-derived test is Apache-2.0.
+The optimized V loader preserves vectorized shared-memory stores and uses
+packed half2 conversion/multiplication. QK uses paged payload/scale TMA;
+PV dequantization loads that same packed cache into registers and writes FP8 V
+to shared memory. The original split-K heuristic and PDL reduction are retained.
+
+Q/KV preparation, scale packing and compilation are excluded from decode
+timings; online P conversion, V dequantization, attention and reduction are
+included. Measurements and validation details are in [PERFORMANCE.md](PERFORMANCE.md).
+
+## Layout
+
+```text
+flashinfer_mla_fp4_fused_dequant/
+  __init__.py
+  mla_config_fp4.py
+  collective_builder_fp4.py
+  mla_decode_fp4.py
+  roles/             # Q/K load, V dequantization, MMA, compute, correction
+  wrappers/
+    batch_mla_fp4.py  # Runner
+  quantization/      # Q/KV quantization and scale packing
+tests/               # numerical references and correctness tests
+examples/            # small runnable example
+```
+
+Only the optimized fused-dequantization route is included. Historical experiment
+scripts, alternative variants and raw profiling artifacts are not installed.

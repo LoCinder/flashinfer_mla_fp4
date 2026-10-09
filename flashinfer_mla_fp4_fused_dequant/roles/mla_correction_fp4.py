@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Correction adapter for mixed E4M3/E2M1 PV."""
+"""Correction adapter for E4M3/E4M3 PV."""
 
 import cutlass.cute as cute
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
@@ -14,7 +14,7 @@ from ..mla_config_fp4 import MLAConfigFP4
 
 
 class MLACorrectionFP4Role(MLACorrectionRole):
-    """Use E4M3 P with E2M1 V while reusing all correction logic."""
+    """Use E4M3 P and dequantized E4M3 V with the original correction logic."""
 
     def __init__(
         self,

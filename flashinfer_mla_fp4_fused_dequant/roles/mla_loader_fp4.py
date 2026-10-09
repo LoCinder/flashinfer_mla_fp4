@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Loader roles for per-token-scaled FP4 MLA decode."""
+"""Q/K payload and native block-scale transport."""
 
 from types import SimpleNamespace
 
@@ -23,11 +23,39 @@ from ..mla_config_fp4 import MLAConfigFP4
 
 
 class MLAFP4LoaderKRole(MLAFP8LoaderKRole):
-    """Reuse the FP8 Q/K TMA path and stage one FP32 scale per token."""
+    """Reuse paged Q/K TMA with native NVFP4 block scales."""
 
     def __init__(self, config: MLAConfigFP4):
         super().__init__(config)
         self.num_scale_groups = config.num_scale_groups
+
+    @cute.jit
+    def _load_q_sf_tma(self, tile_params, params, barrier):
+        cta = tile_params.blk_coord[0] % 2
+        src = params.qsf_tensor[None, None, cta, tile_params.blk_coord[2]]
+        dst = cute.make_tensor(cute.recast_ptr(params.sQSF.iterator, dtype=cutlass.Uint32),
+                               cute.make_layout(1024))
+        s_part, g_part = cpasync.tma_partition(
+            params.qsf_atom, 0, cute.make_layout(1), dst, cute.group_modes(src, 0, 2),
+        )
+        cute.copy(params.qsf_atom, g_part, s_part, tma_bar_ptr=barrier)
+
+    @cute.jit
+    def _load_k_sf_tma(self, tile_params, params, k_index, stage, barrier):
+        dst = cute.recast_ptr(params.sKSF.iterator, dtype=cutlass.Uint32)
+        for half in cutlass.range_constexpr(2):
+            logical = k_index * 128 + half * 64
+            page = cutlass.Int32(-1)  # TMA OOB zero fill still completes its bytes.
+            if logical < tile_params.K:
+                page = tile_params.mPT[logical // 64]
+            for qstage in cutlass.range_constexpr(4):
+                offset = (stage * 4 + qstage) * 256 + half * 128
+                target = cute.make_tensor(dst + offset, cute.make_layout(128))
+                s_part, g_part = cpasync.tma_partition(
+                    params.ksf_atom, 0, cute.make_layout(1), target,
+                    params.ksf_tensor[None, qstage, page],
+                )
+                cute.copy(params.ksf_atom, g_part, s_part, tma_bar_ptr=barrier)
 
     @cute.jit
     def _load_scale_one_tile(
@@ -117,7 +145,7 @@ class MLAFP4LoaderKRole(MLAFP8LoaderKRole):
         tile_sched_params: MLAStaticTileSchedulerParams,
     ):
         """Run the inherited Q/K TMA loop with an aligned scale stage."""
-
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tile_sched = create_mla_static_tile_scheduler(
             tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
         )
@@ -144,22 +172,13 @@ class MLAFP4LoaderKRole(MLAFP8LoaderKRole):
                     if k_tile_count_init == k_tile_count:
                         q_handle = load_q_producer.acquire_and_advance()
                         self._load_q_tma(qk_params, q_handle.barrier)
+                        self._load_q_sf_tma(tile_params, qk_params, q_handle.barrier)
 
                     k_handle = load_k_producer.acquire_and_advance()
-                    self._load_k_one_tile(
-                        tile_params,
-                        qk_params,
-                        k_index,
-                        k_handle.barrier,
-                        k_handle.index,
-                    )
-                    scale_handle = load_scale_producer.acquire_and_advance()
-                    self._load_scale_one_tile(
-                        tile_params,
-                        qk_params,
-                        k_index,
-                        scale_handle,
-                    )
+                    self._load_k_one_tile(tile_params, qk_params, k_index,
+                                          k_handle.barrier, k_handle.index)
+                    self._load_k_sf_tma(tile_params, qk_params, k_index,
+                                         k_handle.index, k_handle.barrier)
                     k_index += 1
                     k_tile_count -= 1
 
@@ -168,11 +187,10 @@ class MLAFP4LoaderKRole(MLAFP8LoaderKRole):
 
         load_q_producer.tail()
         load_k_producer.tail()
-        load_scale_producer.tail()
 
 
-# V uses the same paged TMA movement as FP8; only its MMA consumer differs.
-MLAFP4LoaderVRole = MLAFP8LoaderVRole
+# V is expanded from this same NVFP4 payload into FP8 shared memory.
+from .mla_dequant_v import MLAFP4LoaderVRole
 
 
 __all__ = ["MLAFP4LoaderKRole", "MLAFP4LoaderVRole"]

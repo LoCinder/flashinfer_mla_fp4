@@ -1,16 +1,15 @@
-FlashInfer MLA FP4 Licensing
+FlashInfer MLA FP4 Fused-Dequantization Licensing
 ===========================
 
 Unless otherwise noted in an individual file, this project is distributed
 under the BSD 3-Clause License reproduced below.
 
-The kernel and wrapper sources under flashinfer_mla_fp4/ carry their own
+The kernel and wrapper sources under flashinfer_mla_fp4_fused_dequant/ carry their own
 BSD-3-Clause SPDX identifiers and NVIDIA copyright notices where applicable.
 Those notices must be retained.
 
-The test derived from the FlashInfer project,
-tests/test_cute_dsl_mla_fp4.py, is distributed under the Apache License,
-Version 2.0, as stated in that file. The Apache License is reproduced below.
+The Apache License is also reproduced below for files that retain an
+Apache-2.0 notice. Individual source-file notices take precedence.
 
 
 BSD 3-Clause License

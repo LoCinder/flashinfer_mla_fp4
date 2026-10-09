@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Mixed E4M3/E2M1 MMA role for per-token-scaled FP4 MLA decode."""
+"""Native block-scaled E2M1 QK, E4M3 RoPE, and E4M3/E4M3 PV."""
 
 from types import SimpleNamespace
 from typing import Type
@@ -10,6 +10,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
+import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.pipeline import PipelineConsumer, PipelineProducer
 
 from flashinfer.cute_dsl.attention.mainloop_spec import MLAMainloopSpec
@@ -47,15 +48,62 @@ class MLAMmaFP4Role(MLAMmaFP8Role):
         cta_group = (
             tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         )
-        return sm100_utils.make_trivial_tiled_mma(
-            self.q_dtype,
-            self.k_dtype,
+        return sm100_utils.make_blockscaled_trivial_tiled_mma(
+            cutlass.Float4E2M1FN,
             cute.nvgpu.OperandMajorMode.K,
             cute.nvgpu.OperandMajorMode.K,
-            self.acc_dtype,
+            cutlass.Float8E4M3FN,
+            16,
             cta_group,
             self.mma_qk_tiler[:2],
         )
+
+    @cute.jit
+    def _s2t_sf(self, s_sf, t_sf, is_b: bool = False):
+        if cutlass.const_expr(is_b):
+            # M=128, CTA_GROUP=2 uses the SFB 2x2 TMEM datapath. Arrange
+            # the two K atoms within each 16-byte row, not as two 512B atoms.
+            layout = cute.make_layout(
+                ((((32, 2, 2), 1), (16, 4)), 1, 2, cute.size(s_sf.shape[3])),
+                stride=((((16, 4, 512), 0), (0, 1)), 0, 8, 1024),
+            )
+            s_sf = cute.make_tensor(s_sf.iterator, layout)
+        source, target = cute.filter_zeros(s_sf), cute.filter_zeros(t_sf)
+        op = (tcgen05.Cp2x64x128b0123Op(tcgen05.CtaGroup.TWO)
+              if cutlass.const_expr(is_b) else
+              tcgen05.Cp4x32x128bOp(tcgen05.CtaGroup.TWO))
+        atom = cute.make_copy_atom(op,
+                                   cutlass.Float8E4M3FN)
+        copy = tcgen05.make_s2t_copy(atom, target)
+        thread = copy.get_slice(0)
+        desc = tcgen05.get_s2t_smem_desc_tensor(copy, thread.partition_S(source))
+        return copy, desc, thread.partition_D(target)
+
+    @cute.jit
+    def _gemm_qk_latent_one_stage(self, qk_params, s_stage_index, kv_stage_index,
+                                  q_stage: int, accumulate: bool):
+        mma = self._make_local_qk_mma()
+        acc = qk_params.tStS_staged[None, None, None, s_stage_index]
+        q = qk_params.tSrQ[None, None, None, (q_stage, 0)]
+        k = qk_params.tSrKC[None, None, None, (q_stage, kv_stage_index)]
+        if cutlass.const_expr(q_stage == 0):
+            # Keep all four K-scale slices in disjoint TMEM columns. Issuing
+            # their copies up front avoids repeatedly overwriting the SFB
+            # operand between dependent QK MMAs.
+            for stage in cutlass.range_constexpr(self.iterations_qk_latent):
+                target = cute.make_tensor(
+                    qk_params.ksf_dst.iterator + stage * 32,
+                    qk_params.ksf_dst.layout,
+                )
+                cute.copy(qk_params.ksf_copy,
+                          qk_params.ksf_src[None, None, None, None,
+                                           stage + self.iterations_qk_latent * kv_stage_index],
+                          target)
+        for phase in cutlass.range_constexpr(cute.size(q, mode=[2])):
+            mma.set(tcgen05.Field.SFA, qk_params.tQSF[None, None, phase].iterator + q_stage * 32)
+            mma.set(tcgen05.Field.SFB, qk_params.tKSF[None, None, phase].iterator + q_stage * 32)
+            mma.set(tcgen05.Field.ACCUMULATE, accumulate or phase != 0)
+            cute.gemm(mma, acc, q[None, None, phase], k[None, None, phase], acc)
 
     @cute.jit
     def _make_local_qk_rope_mma(self) -> cute.TiledMma:
@@ -132,8 +180,10 @@ class MLAMmaFP4Role(MLAMmaFP8Role):
         tmem_ptr: cute.Tensor,
         is_leader_cta: cutlass.Boolean,
         L: cutlass.Int32,
+        sQSF: cute.Tensor,
+        sKSF: cute.Tensor,
     ):
-        """Run per-token-scaled QK, then consume one P pipeline item for PV."""
+        """Publish native latent/rope scores, then consume scaled P for PV."""
 
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrKC = tiled_mma_qk.make_fragment_B(sKC)
@@ -165,6 +215,19 @@ class MLAMmaFP4Role(MLAMmaFP8Role):
             score_staged.iterator + self.tmem_o_offset,
             output_layout,
         )
+        qsf_layout = blockscaled_utils.make_tmem_layout_sfa(
+            tiled_mma_qk, self.mma_qk_tiler, 16,
+            cute.slice_(sQSF.layout, (None, None, None, 0)),
+        )
+        ksf_layout = blockscaled_utils.make_tmem_layout_sfb(
+            tiled_mma_qk, self.mma_qk_tiler, 16,
+            cute.slice_(sKSF.layout, (None, None, None, 0)),
+        )
+        tQSF = cute.make_tensor(cute.recast_ptr(tmem_ptr + 416, dtype=cutlass.Float8E4M3FN), qsf_layout)
+        qcols = (self.mma_qk_tiler[0] // 32) * (self.mma_qk_tiler[2] // tiled_mma_qk.shape_mnk[2])
+        tKSF = cute.make_tensor(cute.recast_ptr(tmem_ptr + 416 + qcols * 4, dtype=cutlass.Float8E4M3FN), ksf_layout)
+        qsf_copy, qsf_src, qsf_dst = self._s2t_sf(sQSF, tQSF)
+        ksf_copy, ksf_src, ksf_dst = self._s2t_sf(sKSF, tKSF, True)
 
         tile_sched = create_mla_static_tile_scheduler(
             tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
@@ -188,6 +251,9 @@ class MLAMmaFP4Role(MLAMmaFP8Role):
                     tSrKC=tSrKC,
                     tSrKC_rope=tSrKC_rope,
                     tStS_staged=score_staged,
+                    qsf_copy=qsf_copy, qsf_src=qsf_src, qsf_dst=qsf_dst,
+                    ksf_copy=ksf_copy, ksf_src=ksf_src, ksf_dst=ksf_dst,
+                    tQSF=tQSF, tKSF=tKSF,
                 )
                 pv_params = SimpleNamespace(
                     sP=sP,
@@ -199,6 +265,11 @@ class MLAMmaFP4Role(MLAMmaFP8Role):
 
                 if is_leader_cta:
                     q_handle = load_q_consumer.wait_and_advance()
+                    for qstage in cutlass.range_constexpr(4):
+                        qsf_stage_dst = cute.make_tensor(
+                            qsf_dst.iterator + qstage * 32, qsf_dst.layout,
+                        )
+                        cute.copy(qsf_copy, qsf_src[None, None, None, None, qstage], qsf_stage_dst)
                     kv_handle = load_k_consumer.wait_and_advance()
                     for group in cutlass.range_constexpr(self.num_scale_groups):
                         score_handle = mma_s_producer.acquire_and_advance()
@@ -213,17 +284,12 @@ class MLAMmaFP4Role(MLAMmaFP8Role):
                                 q_stage,
                                 accumulate=(inner > 0),
                             )
+                        for rope_stage in cutlass.range_constexpr(self.iterations_qk_rope):
+                            self._gemm_qk_rope_one_stage(
+                                qk_params, score_handle.index, kv_handle.index,
+                                rope_stage, accumulate=True,
+                            )
                         score_handle.commit()
-                    rope_handle = mma_s_producer.acquire_and_advance()
-                    for rope_stage in cutlass.range_constexpr(self.iterations_qk_rope):
-                        self._gemm_qk_rope_one_stage(
-                            qk_params,
-                            rope_handle.index,
-                            kv_handle.index,
-                            rope_stage,
-                            accumulate=(rope_stage > 0),
-                        )
-                    rope_handle.commit()
                     kv_handle.release()
                     k_tile_count -= 1
 
@@ -242,19 +308,12 @@ class MLAMmaFP4Role(MLAMmaFP8Role):
                                     q_stage,
                                     accumulate=(inner > 0),
                                 )
+                            for rope_stage in cutlass.range_constexpr(self.iterations_qk_rope):
+                                self._gemm_qk_rope_one_stage(
+                                    qk_params, score_handle.index, kv_handle.index,
+                                    rope_stage, accumulate=True,
+                                )
                             score_handle.commit()
-                        rope_handle = mma_s_producer.acquire_and_advance()
-                        for rope_stage in cutlass.range_constexpr(
-                            self.iterations_qk_rope
-                        ):
-                            self._gemm_qk_rope_one_stage(
-                                qk_params,
-                                rope_handle.index,
-                                kv_handle.index,
-                                rope_stage,
-                                accumulate=(rope_stage > 0),
-                            )
-                        rope_handle.commit()
                         kv_handle.release()
                         k_tile_count -= 1
 
